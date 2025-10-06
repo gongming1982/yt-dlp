@@ -5,6 +5,7 @@ import time
 from .common import InfoExtractor
 from .videa import VideaIE
 from ..utils import (
+    ExtractorError,
     InAdvancePagedList,
     int_or_none,
     str_or_none,
@@ -126,40 +127,57 @@ class XimalayaIE(XimalayaBaseIE):
                 f'{scheme}://mpay.ximalaya.com/mobile/track/pay/{audio_id}/{ts}',
                 audio_id, 'Downloading VIP info json', 'Unable to download VIP info file',
                 query={'device': 'pc', 'isBackend': 'true', '_': ts})
-            filename = self._decrypt_filename(vip_info['fileId'], vip_info['seed'])
-            sign, token, timestamp = self._decrypt_url_params(vip_info['ep'])
-            vip_url = update_url_query(
-                f'{vip_info["domain"]}/download/{vip_info["apiVersion"]}{filename}', {
-                    'sign': sign,
-                    'token': token,
-                    'timestamp': timestamp,
-                    'buy_key': vip_info['buyKey'],
-                    'duration': vip_info['duration'],
-                })
-            fmt = {
-                'format_id': 'vip',
-                'url': vip_url,
-                'vcodec': 'none',
-            }
-            if '_preview_' in vip_url:
+            
+            # 检查VIP API返回状态和权限
+            if vip_info.get('ret') != 0:
+                error_msg = vip_info.get('msg', 'Unknown error')
+                if vip_info.get('ret') == 999:
+                    error_msg = 'Account error - VIP subscription may be required or cookie may be invalid'
                 self.report_warning(
-                    f'This tracks requires a VIP account. Using a sample instead. {self._login_hint()}')
-                fmt.update({
-                    'format_note': 'Sample',
-                    'preference': -10,
-                    **traverse_obj(vip_info, {
-                        'filesize': ('sampleLength', {int_or_none}),
-                        'duration': ('sampleDuration', {int_or_none}),
-                    }),
-                })
+                    f'VIP API returned error code: {vip_info.get("ret")}, msg: {error_msg}. '
+                    f'Try updating your cookies with --cookies or --cookies-from-browser')
+            elif not vip_info.get('isAuthorized', False):
+                self.report_warning(
+                    f'This track requires a VIP account. {self._login_hint()}')
+            elif 'fileId' not in vip_info or 'ep' not in vip_info:
+                self.report_warning(
+                    f'VIP info missing required fields. Response: {vip_info}')
             else:
-                fmt.update(traverse_obj(vip_info, {
-                    'filesize': ('totalLength', {int_or_none}),
-                    'duration': ('duration', {int_or_none}),
-                }))
+                # 成功获取VIP信息,构建下载URL
+                filename = self._decrypt_filename(vip_info['fileId'], vip_info['seed'])
+                sign, token, timestamp = self._decrypt_url_params(vip_info['ep'])
+                vip_url = update_url_query(
+                    f'{vip_info["domain"]}/download/{vip_info["apiVersion"]}{filename}', {
+                        'sign': sign,
+                        'token': token,
+                        'timestamp': timestamp,
+                        'buy_key': vip_info['buyKey'],
+                        'duration': vip_info['duration'],
+                    })
+                fmt = {
+                    'format_id': 'vip',
+                    'url': vip_url,
+                    'vcodec': 'none',
+                }
+                if '_preview_' in vip_url:
+                    self.report_warning(
+                        f'This tracks requires a VIP account. Using a sample instead. {self._login_hint()}')
+                    fmt.update({
+                        'format_note': 'Sample',
+                        'preference': -10,
+                        **traverse_obj(vip_info, {
+                            'filesize': ('sampleLength', {int_or_none}),
+                            'duration': ('sampleDuration', {int_or_none}),
+                        }),
+                    })
+                else:
+                    fmt.update(traverse_obj(vip_info, {
+                        'filesize': ('totalLength', {int_or_none}),
+                        'duration': ('duration', {int_or_none}),
+                    }))
 
-            fmt['abr'] = try_call(lambda: fmt['filesize'] * 8 / fmt['duration'] / 1024)
-            formats.append(fmt)
+                fmt['abr'] = try_call(lambda: fmt['filesize'] * 8 / fmt['duration'] / 1024)
+                formats.append(fmt)
 
         formats.extend([{
             'format_id': f'{bps}k',
@@ -167,6 +185,16 @@ class XimalayaIE(XimalayaBaseIE):
             'abr': bps,
             'vcodec': 'none',
         } for bps, k in ((24, 'play_path_32'), (64, 'play_path_64')) if audio_info.get(k)])
+
+        # 如果没有找到任何格式,提供有用的错误信息
+        if not formats:
+            if audio_info.get('is_paid'):
+                self.raise_login_required(
+                    'This track is VIP-only and requires a valid VIP account. '
+                    'Please provide valid cookies with --cookies or --cookies-from-browser',
+                    method='cookies')
+            else:
+                raise ExtractorError('No playable formats found', expected=True)
 
         thumbnails = []
         for k in audio_info:
@@ -222,25 +250,39 @@ class XimalayaAlbumIE(XimalayaBaseIE):
     def _real_extract(self, url):
         playlist_id = self._match_id(url)
 
-        first_page = self._fetch_page(playlist_id, 1)
-        page_count = math.ceil(first_page['trackTotalCount'] / first_page['pageSize'])
+        # 使用新的API获取专辑基本信息
+        meta = self._download_json('https://www.ximalaya.com/revision/album/v1/simple',
+                                   playlist_id, note='Downloading album info', query={'albumId': playlist_id})
+        title = traverse_obj(meta, ('data', 'albumPageMainInfo', 'albumTitle'))
+
+        # 分页获取所有音轨
+        page_size = 30
+        page_idx = 1
+        page_cache = {}
+        while True:
+            page_data = self._fetch_page(playlist_id, page_idx, page_size)
+            page_cache[str(page_idx)] = page_data
+            if len(page_data) < page_size:
+                break
+            page_idx += 1
+
+        page_count = page_idx
 
         entries = InAdvancePagedList(
-            lambda idx: self._get_entries(self._fetch_page(playlist_id, idx + 1) if idx else first_page),
-            page_count, first_page['pageSize'])
-
-        title = traverse_obj(first_page, ('tracks', 0, 'albumTitle'), expected_type=str)
+            lambda idx: self._get_entries(page_cache.get(str(idx + 1))),
+            page_count, page_size)
 
         return self.playlist_result(entries, playlist_id, title)
 
-    def _fetch_page(self, playlist_id, page_idx):
-        return self._download_json(
-            'https://www.ximalaya.com/revision/album/v1/getTracksList',
+    def _fetch_page(self, playlist_id, page_idx, page_size=30):
+        meta = self._download_json(
+            'https://www.ximalaya.com/revision/play/v1/show',
             playlist_id, note=f'Downloading tracks list page {page_idx}',
-            query={'albumId': playlist_id, 'pageNum': page_idx})['data']
+            query={'id': playlist_id, 'num': page_idx, 'size': page_size, 'ptype': 0})
+        return traverse_obj(meta, ('data', 'tracksAudioPlay'))
 
     def _get_entries(self, page_data):
-        for e in page_data['tracks']:
+        for e in page_data:
             yield self.url_result(
-                self._proto_relative_url(f'//www.ximalaya.com{e["url"]}'),
-                XimalayaIE, e.get('trackId'), e.get('title'))
+                self._proto_relative_url(f'//www.ximalaya.com{e.get("trackUrl")}'),
+                XimalayaIE, e.get('trackId'), e.get('trackName'))
